@@ -240,20 +240,36 @@ export class AntigravityApiService {
         this.config = config;
         this.host = config.HOST;
         this.oauthCredsFilePath = config.ANTIGRAVITY_OAUTH_CREDS_FILE_PATH;
-        this.baseURL = DEFAULT_ANTIGRAVITY_BASE_URL_DAILY; // 使用通用 GEMINI_BASE_URL 配置
-        this.userAgent = DEFAULT_USER_AGENT; // 支持通用 USER_AGENT 配置
+        
+        // --- 修改点 1：注释掉错误的硬编码赋值 ---
+        // 下面这行代码是问题的根源，它强制将 baseURL 设置为默认值，导致后续逻辑出错。
+        // this.baseURL = DEFAULT_ANTIGRAVITY_BASE_URL_DAILY; // 使用通用 GEMINI_BASE_URL 配置
+
+        // --- 修改点 2：修复 userAgent 的硬编码，使其能正确使用 config 中的值 ---
+        this.userAgent = config.USER_AGENT || DEFAULT_USER_AGENT; // 支持通用 USER_AGENT 配置
+
         this.projectId = config.PROJECT_ID;
 
         // Initialize instance-specific endpoints
+        // 下面这两行逻辑是正确的，它优先使用 config 中的值，如果不存在则使用默认值
         this.baseUrlDaily = config.ANTIGRAVITY_BASE_URL_DAILY || DEFAULT_ANTIGRAVITY_BASE_URL_DAILY;
         this.baseUrlAutopush = config.ANTIGRAVITY_BASE_URL_AUTOPUSH || DEFAULT_ANTIGRAVITY_BASE_URL_AUTOPUSH;
 
-        // 多环境降级顺序
-        this.baseURLs = this.baseURL ? [this.baseURL] : [
+        // --- 修改点 3：修正 baseURLs 的赋值逻辑 ---
+        // 原来的三元表达式因为上面的错误硬编码而失效。
+        // 现在直接使用准备好的 this.baseUrlDaily 和 this.baseUrlAutopush 来构建降级列表。
+        this.baseURLs = [
             this.baseUrlDaily,
             this.baseUrlAutopush
-            // ANTIGRAVITY_BASE_URL_PROD // 生产环境已注释
-        ];
+        ]
+        // 添加一个简单的过滤和去重，以增加代码健壮性，不影响核心逻辑。
+        // 这能处理用户同时为 daily 和 autopush 配置了相同 URL 的情况。
+        .filter((url, index, self) => url && self.indexOf(url) === index);
+
+        // 如果经过配置和过滤后，列表为空，则提供一个最终的默认值以避免程序崩溃
+        if (this.baseURLs.length === 0) {
+            this.baseURLs.push(DEFAULT_ANTIGRAVITY_BASE_URL_DAILY);
+        }
     }
 
     async initialize() {
