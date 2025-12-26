@@ -1,6 +1,8 @@
 import axios from 'axios';
 import * as http from 'http';
 import * as https from 'https';
+// 引入 Node.js 内置的 StringDecoder
+import { StringDecoder } from 'string_decoder'; 
 
 // OpenAI Responses API specification service for interacting with third-party models
 export class OpenAIResponsesApiService {
@@ -96,9 +98,13 @@ export class OpenAIResponsesApiService {
 
             const stream = response.data;
             let buffer = '';
+            // 初始化 StringDecoder，用于正确处理跨 chunk 的多字节字符
+            const decoder = new StringDecoder('utf8'); 
 
             for await (const chunk of stream) {
-                buffer += chunk.toString();
+                // 使用 decoder.write() 替代 chunk.toString()
+                // StringDecoder 会在内部缓冲不完整的字符序列，直到下一个 chunk 补齐
+                buffer += decoder.write(chunk); 
                 let newlineIndex;
                 while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
                     const line = buffer.substring(0, newlineIndex).trim();
@@ -120,6 +126,24 @@ export class OpenAIResponsesApiService {
                     }
                 }
             }
+            // 在流结束时，确保处理完 decoder 中所有剩余的字节（如果有的话）
+            buffer += decoder.end(); 
+            // 检查处理完 decoder.end() 后是否还有未处理的行
+            if (buffer.length > 0) {
+                const line = buffer.trim();
+                if (line.startsWith('data: ')) {
+                    const jsonData = line.substring(6).trim();
+                    if (jsonData !== '[DONE]') { // 即使是最后一个 chunk，如果不是 [DONE]，也尝试解析
+                        try {
+                            const parsedChunk = JSON.parse(jsonData);
+                            yield parsedChunk;
+                        } catch (e) {
+                            console.warn("[OpenAIResponsesApiService] Failed to parse final stream chunk JSON:", e.message, "Data:", jsonData);
+                        }
+                    }
+                }
+            }
+
         } catch (error) {
             const status = error.response?.status;
             const data = error.response?.data;
