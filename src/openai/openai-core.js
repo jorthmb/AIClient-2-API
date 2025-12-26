@@ -1,6 +1,8 @@
 import axios from 'axios';
 import * as http from 'http';
 import * as https from 'https';
+// 引入 Node.js 内置的 StringDecoder
+import { StringDecoder } from 'string_decoder'; 
 
 // Assumed OpenAI API specification service for interacting with third-party models
 export class OpenAIApiService {
@@ -96,9 +98,14 @@ export class OpenAIApiService {
 
             const stream = response.data;
             let buffer = '';
-
+            // 初始化 StringDecoder，用于正确处理跨 chunk 的多字节字符
+            const decoder = new StringDecoder('utf8'); 
+            
             for await (const chunk of stream) {
-                buffer += chunk.toString();
+                //buffer += chunk.toString();
+                // 使用 decoder.write() 替代 chunk.toString()
+                // StringDecoder 会在内部缓冲不完整的字符序列，直到下一个 chunk 补齐
+                buffer += decoder.write(chunk); 
                 let newlineIndex;
                 while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
                     const line = buffer.substring(0, newlineIndex).trim();
@@ -117,6 +124,29 @@ export class OpenAIApiService {
                         }
                     } else if (line === '') {
                         // Empty line, end of an event
+                    }
+                }
+            }
+            // 在流结束时，确保处理完 decoder 中所有剩余的字节（如果有的话）
+            // 对于 event-stream，通常以换行符分隔，decoder 应该不会有太多剩余，
+            // 但这是一个好的实践以防万一。
+            buffer += decoder.end(); 
+            // 检查处理完 decoder.end() 后是否还有未处理的行
+            // 这通常发生在流在非换行符处突然中断的情况下
+            if (buffer.length > 0) {
+                 // 处理最后可能不以换行符结尾的数据
+                const line = buffer.trim();
+                if (line.startsWith('data: ')) {
+                    const jsonData = line.substring(6).trim();
+                    if (jsonData === '[DONE]') {
+                        // Nothing to do, already handled by return
+                    } else {
+                        try {
+                            const parsedChunk = JSON.parse(jsonData);
+                            yield parsedChunk;
+                        } catch (e) {
+                            console.warn("[OpenAIApiService] Failed to parse final stream chunk JSON:", e.message, "Data:", jsonData);
+                        }
                     }
                 }
             }
