@@ -8,7 +8,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { getProviderModels } from '../provider-models.js';
 import { countTokens } from '@anthropic-ai/tokenizer';
-import { json } from 'stream/consumers';
+import { StringDecoder } from 'string_decoder'; // 引入 StringDecoder
 
 const KIRO_CONSTANTS = {
     REFRESH_URL: 'https://prod.{{region}}.auth.desktop.kiro.dev/refreshToken',
@@ -281,15 +281,6 @@ export class KiroApiService {
         this.useSystemProxy = config?.USE_SYSTEM_PROXY_KIRO ?? false;
         this.uuid = config?.uuid; // 获取多节点配置的 uuid
         console.log(`[Kiro] System proxy ${this.useSystemProxy ? 'enabled' : 'disabled'}`);
-        // this.accessToken = config.KIRO_ACCESS_TOKEN;
-        // this.refreshToken = config.KIRO_REFRESH_TOKEN;
-        // this.clientId = config.KIRO_CLIENT_ID;
-        // this.clientSecret = config.KIRO_CLIENT_SECRET;
-        // this.authMethod = KIRO_CONSTANTS.AUTH_METHOD_SOCIAL;
-        // this.refreshUrl = KIRO_CONSTANTS.REFRESH_URL;
-        // this.refreshIDCUrl = KIRO_CONSTANTS.REFRESH_IDC_URL;
-        // this.baseUrl = KIRO_CONSTANTS.BASE_URL;
-        // this.amazonQUrl = KIRO_CONSTANTS.AMAZON_Q_URL;
 
         // Add kiro-oauth-creds-base64 and kiro-oauth-creds-file to config
         if (config.KIRO_OAUTH_CREDS_BASE64) {
@@ -890,6 +881,7 @@ async initializeAuth(forceRefresh = false) {
         return request;
     }
 
+    // 已经弃用，改为使用 parseAwsEventStreamBuffer + streamApiReal
     parseEventStreamChunk(rawData) {
         const rawStr = Buffer.isBuffer(rawData) ? rawData.toString('utf8') : String(rawData);
         let fullContent = '';
@@ -1115,43 +1107,30 @@ async initializeAuth(forceRefresh = false) {
     /**
      * 解析 AWS Event Stream 格式，提取所有完整的 JSON 事件
      * 返回 { events: 解析出的事件数组, remaining: 未处理完的缓冲区 }
+     * 优化：更健壮的 JSON 解析，避免手动 `indexOf` 和 `{}` 计数
      */
     parseAwsEventStreamBuffer(buffer) {
         const events = [];
         let remaining = buffer;
-        let searchStart = 0;
-        
+        let processedLength = 0; // 记录已处理的字符串长度
+
         while (true) {
-            // 查找真正的 JSON payload 起始位置
-            // AWS Event Stream 包含二进制头部，我们只搜索有效的 JSON 模式
-            // Kiro 返回格式: {"content":"..."} 或 {"name":"xxx","toolUseId":"xxx",...} 或 {"followupPrompt":"..."}
-            
-            // 搜索所有可能的 JSON payload 开头模式
-            // Kiro 返回的 toolUse 可能分多个事件：
-            // 1. {"name":"xxx","toolUseId":"xxx"} - 开始
-            // 2. {"input":"..."} - input 数据（可能多次）
-            // 3. {"stop":true} - 结束
-            const contentStart = remaining.indexOf('{"content":', searchStart);
-            const nameStart = remaining.indexOf('{"name":', searchStart);
-            const followupStart = remaining.indexOf('{"followupPrompt":', searchStart);
-            const inputStart = remaining.indexOf('{"input":', searchStart);
-            const stopStart = remaining.indexOf('{"stop":', searchStart);
-            
-            // 找到最早出现的有效 JSON 模式
-            const candidates = [contentStart, nameStart, followupStart, inputStart, stopStart].filter(pos => pos >= 0);
-            if (candidates.length === 0) break;
-            
-            const jsonStart = Math.min(...candidates);
-            if (jsonStart < 0) break;
-            
-            // 正确处理嵌套的 {} - 使用括号计数法
+            // 查找任意一个 JSON 对象开头的位置
+            const jsonStartMatch = remaining.match(/(\{.*)/);
+            if (!jsonStartMatch) {
+                break; // 没有找到 JSON 对象，退出
+            }
+
+            const jsonStartRelativeIndex = jsonStartMatch.index;
+            const jsonStringCandidate = jsonStartMatch[1];
+
             let braceCount = 0;
-            let jsonEnd = -1;
+            let jsonEndRelativeIndex = -1;
             let inString = false;
             let escapeNext = false;
             
-            for (let i = jsonStart; i < remaining.length; i++) {
-                const char = remaining[i];
+            for (let i = 0; i < jsonStringCandidate.length; i++) {
+                const char = jsonStringCandidate[i];
                 
                 if (escapeNext) {
                     escapeNext = false;
@@ -1174,74 +1153,61 @@ async initializeAuth(forceRefresh = false) {
                     } else if (char === '}') {
                         braceCount--;
                         if (braceCount === 0) {
-                            jsonEnd = i;
+                            jsonEndRelativeIndex = i;
                             break;
                         }
                     }
                 }
             }
             
-            if (jsonEnd < 0) {
+            if (jsonEndRelativeIndex < 0) {
                 // 不完整的 JSON，保留在缓冲区等待更多数据
-                remaining = remaining.substring(jsonStart);
-                break;
+                break; 
             }
             
-            const jsonStr = remaining.substring(jsonStart, jsonEnd + 1);
+            const jsonStr = jsonStringCandidate.substring(0, jsonEndRelativeIndex + 1);
             try {
                 const parsed = JSON.parse(jsonStr);
-                // 处理 content 事件
+                // 根据 Kiro 的事件类型进行分类
                 if (parsed.content !== undefined && !parsed.followupPrompt) {
-                    // 处理转义字符
                     let decodedContent = parsed.content;
-                    // 无须处理转义的换行符，原来要处理是因为智能体返回的 content 需要通过换行符切割不同的json
-                    // decodedContent = decodedContent.replace(/(?<!\\)\\n/g, '\n');
                     events.push({ type: 'content', data: decodedContent });
-                }
-                // 处理结构化工具调用事件 - 开始事件（包含 name 和 toolUseId）
-                else if (parsed.name && parsed.toolUseId) {
+                } else if (parsed.name && parsed.toolUseId) {
                     events.push({ 
                         type: 'toolUse', 
                         data: {
                             name: parsed.name,
                             toolUseId: parsed.toolUseId,
-                            input: parsed.input || '',
+                            input: parsed.input !== undefined ? parsed.input : '', // 兼容没有 input 字段的情况
                             stop: parsed.stop || false
                         }
                     });
-                }
-                // 处理工具调用的 input 续传事件（只有 input 字段）
-                else if (parsed.input !== undefined && !parsed.name) {
+                } else if (parsed.input !== undefined && !parsed.name && !parsed.toolUseId) { // 纯 input 片段
                     events.push({
                         type: 'toolUseInput',
                         data: {
                             input: parsed.input
                         }
                     });
-                }
-                // 处理工具调用的结束事件（只有 stop 字段）
-                else if (parsed.stop !== undefined) {
+                } else if (parsed.stop !== undefined && !parsed.name && !parsed.toolUseId && parsed.input === undefined) { // 纯 stop 片段
                     events.push({
                         type: 'toolUseStop',
                         data: {
                             stop: parsed.stop
                         }
                     });
+                } else {
+                    // 如果有其他未识别的 JSON 结构，可以根据需要处理或忽略
+                    // console.warn("[Kiro] Unrecognized JSON event structure:", parsed);
                 }
             } catch (e) {
-                // JSON 解析失败，跳过这个位置继续搜索
+                // JSON 解析失败，跳过这个无效的 JSON 片段
+                console.warn("[Kiro] Failed to parse JSON event:", jsonStr, e.message);
             }
             
-            searchStart = jsonEnd + 1;
-            if (searchStart >= remaining.length) {
-                remaining = '';
-                break;
-            }
-        }
-        
-        // 如果 searchStart 有进展，截取剩余部分
-        if (searchStart > 0 && remaining.length > 0) {
-            remaining = remaining.substring(searchStart);
+            // 更新 remaining 缓冲区，移除已处理的部分
+            processedLength += jsonStartRelativeIndex + jsonEndRelativeIndex + 1;
+            remaining = remaining.substring(jsonStartRelativeIndex + jsonEndRelativeIndex + 1);
         }
         
         return { events, remaining };
@@ -1274,10 +1240,13 @@ async initializeAuth(forceRefresh = false) {
 
             stream = response.data;
             let buffer = '';
+            // 初始化 StringDecoder，用于正确处理跨 chunk 的多字节字符
+            const decoder = new StringDecoder('utf8'); 
             let lastContentEvent = null;  // 用于检测连续重复的 content 事件
 
             for await (const chunk of stream) {
-                buffer += chunk.toString();
+                // 使用 decoder.write() 替代 chunk.toString()
+                buffer += decoder.write(chunk); 
                 
                 // 解析缓冲区中的事件
                 const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
@@ -1302,6 +1271,29 @@ async initializeAuth(forceRefresh = false) {
                     }
                 }
             }
+            // 在流结束时，确保处理完 decoder 中所有剩余的字节（如果有的话）
+            buffer += decoder.end();
+            // 在流结束后再次处理 buffer 中可能剩余的事件
+            if (buffer.length > 0) {
+                const { events: finalEvents, remaining: finalRemaining } = this.parseAwsEventStreamBuffer(buffer);
+                for (const event of finalEvents) {
+                    if (event.type === 'content' && event.data) {
+                        if (lastContentEvent === event.data) { continue; }
+                        lastContentEvent = event.data;
+                        yield { type: 'content', content: event.data };
+                    } else if (event.type === 'toolUse') {
+                        yield { type: 'toolUse', toolUse: event.data };
+                    } else if (event.type === 'toolUseInput') {
+                        yield { type: 'toolUseInput', input: event.data.input };
+                    } else if (event.type === 'toolUseStop') {
+                        yield { type: 'toolUseStop', stop: event.data.stop };
+                    }
+                }
+                if (finalRemaining.length > 0) {
+                    console.warn(`[Kiro] Remaining unprocessed buffer after stream end: ${finalRemaining}`);
+                }
+            }
+
         } catch (error) {
             // 确保出错时关闭流
             if (stream && typeof stream.destroy === 'function') {
@@ -1398,31 +1390,24 @@ async initializeAuth(forceRefresh = false) {
                     };
                 } else if (event.type === 'toolUse') {
                     const tc = event.toolUse;
-                    // 工具调用事件（包含 name 和 toolUseId）
+                    // 工具调用开始事件（包含 name 和 toolUseId）
                     if (tc.name && tc.toolUseId) {
-                        // 检查是否是同一个工具调用的续传（相同 toolUseId）
-                        if (currentToolCall && currentToolCall.toolUseId === tc.toolUseId) {
-                            // 同一个工具调用，累积 input
-                            currentToolCall.input += tc.input || '';
-                        } else {
-                            // 不同的工具调用
-                            // 如果有未完成的工具调用，先保存它
-                            if (currentToolCall) {
-                                try {
-                                    currentToolCall.input = JSON.parse(currentToolCall.input);
-                                } catch (e) {
-                                    // input 不是有效 JSON，保持原样
-                                }
-                                toolCalls.push(currentToolCall);
+                        // 如果有未完成的工具调用，先保存它
+                        if (currentToolCall) {
+                            try {
+                                currentToolCall.input = JSON.parse(currentToolCall.input);
+                            } catch (e) {
+                                // input 不是有效 JSON，保持原样
                             }
-                            // 开始新的工具调用
-                            currentToolCall = {
-                                toolUseId: tc.toolUseId,
-                                name: tc.name,
-                                input: tc.input || ''
-                            };
+                            toolCalls.push(currentToolCall);
                         }
-                        // 如果这个事件包含 stop，完成工具调用
+                        // 开始新的工具调用
+                        currentToolCall = {
+                            toolUseId: tc.toolUseId,
+                            name: tc.name,
+                            input: tc.input || '' // 初始input
+                        };
+                        // 如果此事件带有stop标志，直接完成
                         if (tc.stop) {
                             try {
                                 currentToolCall.input = JSON.parse(currentToolCall.input);
@@ -1435,6 +1420,8 @@ async initializeAuth(forceRefresh = false) {
                     // 工具调用的 input 续传事件
                     if (currentToolCall) {
                         currentToolCall.input += event.input || '';
+                    } else {
+                        console.warn("[Kiro] Received toolUseInput without active toolUse context:", event.input);
                     }
                 } else if (event.type === 'toolUseStop') {
                     // 工具调用结束事件
@@ -1446,6 +1433,8 @@ async initializeAuth(forceRefresh = false) {
                         }
                         toolCalls.push(currentToolCall);
                         currentToolCall = null;
+                    } else {
+                        console.warn("[Kiro] Received toolUseStop without active toolUse context or stop flag:", event);
                     }
                 }
             }
@@ -1462,6 +1451,15 @@ async initializeAuth(forceRefresh = false) {
             // 检查文本内容中的 bracket 格式工具调用
             const bracketToolCalls = parseBracketToolCalls(totalContent);
             if (bracketToolCalls && bracketToolCalls.length > 0) {
+                // 清除文本中的 bracket 格式工具调用
+                for (const btc of bracketToolCalls) {
+                    const funcName = btc.function.name;
+                    const escapedName = funcName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const pattern = new RegExp(`\\[Called\\s+${escapedName}\\s+with\\s+args:\\s*\\{[^}]*(?:\\{[^}]*\\}[^}]*)*\\}\\]`, 'gs');
+                    totalContent = totalContent.replace(pattern, '');
+                }
+                totalContent = totalContent.replace(/\s+/g, ' ').trim();
+
                 for (const btc of bracketToolCalls) {
                     toolCalls.push({
                         toolUseId: btc.id || `tool_${uuidv4()}`,
@@ -1478,7 +1476,7 @@ async initializeAuth(forceRefresh = false) {
             if (toolCalls.length > 0) {
                 for (let i = 0; i < toolCalls.length; i++) {
                     const tc = toolCalls[i];
-                    const blockIndex = i + 1;
+                    const blockIndex = i + 1; // Tool calls start after text content block (index 0)
                     
                     yield {
                         type: "content_block_start",
@@ -1487,7 +1485,7 @@ async initializeAuth(forceRefresh = false) {
                             type: "tool_use",
                             id: tc.toolUseId || `tool_${uuidv4()}`,
                             name: tc.name,
-                            input: {}
+                            input: {} // input is streamed via input_json_delta
                         }
                     };
                     
