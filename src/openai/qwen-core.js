@@ -10,6 +10,8 @@ import { EventEmitter } from 'events';
 import { randomUUID } from 'node:crypto';
 import { getProviderModels } from '../provider-models.js';
 import { handleQwenOAuth } from '../oauth-handlers.js';
+// 引入 Node.js 内置的 StringDecoder
+import { StringDecoder } from 'string_decoder'; 
 
 // --- Constants ---
 const QWEN_DIR = '.qwen';
@@ -578,8 +580,13 @@ export class QwenApiService {
     async *generateContentStream(model, requestBody) {
         const stream = await this.callApiWithAuthAndRetry('/chat/completions', requestBody, true);
         let buffer = '';
+        // 初始化 StringDecoder，用于正确处理跨 chunk 的多字节字符
+        const decoder = new StringDecoder('utf8'); 
+
         for await (const chunk of stream) {
-            buffer += chunk.toString();
+            // 使用 decoder.write() 替代 chunk.toString()
+            // StringDecoder 会在内部缓冲不完整的字符序列，直到下一个 chunk 补齐
+            buffer += decoder.write(chunk); 
             let newlineIndex;
             while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
                 const line = buffer.substring(0, newlineIndex).trim();
@@ -591,7 +598,24 @@ export class QwenApiService {
                     try {
                         yield JSON.parse(jsonData);
                     } catch (e) {
-                        console.warn("[QwenApiService] Failed to parse stream chunk:", jsonData);
+                        console.warn("[QwenApiService] Failed to parse stream chunk JSON:", e.message, "Data:", jsonData);
+                    }
+                }
+            }
+        }
+        // 在流结束时，确保处理完 decoder 中所有剩余的字节（如果有的话）
+        buffer += decoder.end(); 
+        // 检查处理完 decoder.end() 后是否还有未处理的行
+        if (buffer.length > 0) {
+            const line = buffer.trim();
+            if (line.startsWith('data: ')) {
+                const jsonData = line.substring(6).trim();
+                // 即使是最后一个 chunk，如果不是 [DONE]，也尝试解析
+                if (jsonData !== '[DONE]') { 
+                    try {
+                        yield JSON.parse(jsonData);
+                    } catch (e) {
+                        console.warn("[QwenApiService] Failed to parse final stream chunk JSON:", e.message, "Data:", jsonData);
                     }
                 }
             }
